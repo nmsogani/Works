@@ -1,1 +1,167 @@
+import os
+import pandas as pd
+import win32com.client as win32
+from datetime import datetime
+import time
 
+# ---------- CONFIG ----------
+EXCEL_FILE = r"C:\Users\naman\PycharmProjects\CodingWorks\MailingAuto.xlsx"
+TEMPLATES_DIR = r"C:\Users\naman\PycharmProjects\CodingWorks\templates"
+ATTACHMENTS_DIR = r"C:\Users\naman\PycharmProjects\CodingWorks\Attachments"  # Folder where attachments are stored
+LOG_FILE = r"C:\Users\naman\PycharmProjects\CodingWorks\LogOfEmail.xlsx"
+DRY_RUN = True  # True for preview, False to actually send emails
+DELAY_MS = 500  # Delay between emails in milliseconds
+
+# ---------- STATUS TO TEMPLATE MAPPING ----------
+STATUS_TO_TEMPLATE = {
+    "Pending for Approvals": "Pending for Approvals.txt",
+    "Project Commissioned": "Project Commissioned.txt",
+    "Construction Started": "Construction Started.txt",
+    "Incentives Related Issue": "Incentives Related Issue.txt",
+    "Land Related Issue": "Land Related Issue.txt",
+    "Land Required": "Land Required.txt",
+    "Not Aware about the MoU": "Not Aware about the MoU.txt",
+    "MoU On Hold": "MoU On Hold.txt",
+    "MoU Dropped": "MoU Dropped.txt",
+    "Other Issues": "Other Issues.txt",
+    "Policy Related Issues": "Policy Related Issues.txt",
+    "Support Infrastructure Required": "Support Infrastructure Required.txt"
+}
+# ---------- LOAD EXCEL ----------
+if not os.path.exists(EXCEL_FILE):
+    raise FileNotFoundError(f"Main Excel file not found: {EXCEL_FILE}")
+
+df = pd.read_excel(EXCEL_FILE)
+
+# ---------- INIT OUTLOOK ----------
+outlook = win32.Dispatch('Outlook.Application')
+
+
+# ---------- HELPER TO LOAD TEMPLATE ----------
+def load_template(status):
+    status_clean = status.replace('\u200b', '').strip()
+    template_file = STATUS_TO_TEMPLATE.get(status_clean)
+    if not template_file:
+        raise FileNotFoundError(f"No template mapping for status: {status_clean}")
+    template_path = os.path.join(TEMPLATES_DIR, template_file)
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Template file not found: {template_file}")
+    with open(template_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+# ---------- PROCESS ROWS ----------
+log_data = []
+
+for idx, row in df.iterrows():
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mou_no = str(row.get('MoU No.', '')).strip()
+    recipient = str(row.get('Auth. Signatory (Email)', '')).strip()
+    status = str(row.get('Mail Status', '')).strip()
+    attachments_cell = str(row.get('Attachment', '')).strip()  # New column for attachments
+
+    # Split multiple attachments by comma
+    attachments_list = [x.strip() for x in attachments_cell.split(',')] if attachments_cell else []
+
+    # Check mandatory columns
+    if not mou_no or not recipient or not status:
+        log_data.append({
+            'MoU No.': mou_no,
+            'Auth. Signatory (Email)': recipient,
+            'IP Expert': row.get('IP Expert', ''),
+            'Status of mail': 'Skipped (missing mandatory field)',
+            'Timestamp': timestamp
+
+        })
+        print(f"Skipped row {int(idx) + 2} - mandatory field missing (MoU No / Email / Mail Status)")
+        continue
+
+    try:
+        template = load_template(status)
+    except FileNotFoundError:
+        log_data.append({
+            'MoU No.': mou_no,
+            'Auth. Signatory (Email)': recipient,
+            'IP Expert': row.get('IP Expert', ''),
+            'Status of mail': f'Skipped (template missing: {status})',
+            'Timestamp': timestamp
+
+        })
+        print(f"Skipped {mou_no} - template missing for status: {status}")
+        continue
+
+    # Replace placeholders
+    body = template.replace('<MoU No>', mou_no)
+    body = body.replace('<IP Expert Name>', str(row.get('IP Expert', '')))
+    body = body.replace('<IP Expert Mobile No>', str(row.get('IP Expert Mobile Number', '')))
+
+    # ---------- SEND EMAIL ----------
+    account_found = False
+    for account in outlook.Session.Accounts:
+        if account.SmtpAddress.lower() == "risingrajasthan.mou1@rajasthan.gov.in".lower():
+            account_found = True
+            if not DRY_RUN:
+                mail = outlook.CreateItem(0)
+                mail.To = recipient
+                mail.Subject = f"{status} | {mou_no}"
+                mail.Body = body
+                # Attach files if any
+                for attachment_file in attachments_list:
+                    if attachment_file:
+                        attachment_path = os.path.join(ATTACHMENTS_DIR, attachment_file)
+                        if os.path.exists(attachment_path):
+                            mail.Attachments.Add(attachment_path)
+                        else:
+                            print(f"Attachment not found for {mou_no}: {attachment_file}")
+                mail.SendUsingAccount = account
+                mail.Send()
+            else:
+                # Dry run preview
+                valid_attachments = []
+                for attachment_file in attachments_list:
+                    if attachment_file:
+                        attachment_path = os.path.join(ATTACHMENTS_DIR, attachment_file)
+                        if os.path.exists(attachment_path):
+                            valid_attachments.append(attachment_file)
+                        else:
+                            print(f"Attachment not found for {mou_no} (dry run): {attachment_file}")
+                print("\n--- DRY RUN ---")
+                print(f"To: {recipient}")
+                print(f"Subject: {status} | {mou_no}")
+                print(f"Body preview: {body[:200]}...")
+                if valid_attachments:
+                    print(f"Attachments: {', '.join(valid_attachments)}")
+                else:
+                    print("Attachments: None")
+            break
+
+    if not account_found:
+        log_status = "Failed - account not found"
+        print(f"Cannot send mail for {mou_no} - Outlook account risingrajasthan.mou1@rajasthan.gov.in not found")
+    else:
+        log_status = "Dry run (not sent)" if DRY_RUN else "Sent"
+
+    log_data.append({
+        'MoU No.': mou_no,
+        'Auth. Signatory (Email)': recipient,
+        'IP Expert': row.get('IP Expert', ''),
+        'Status of mail': log_status,
+        'Timestamp': timestamp
+
+    })
+
+    # Delay
+    time.sleep(DELAY_MS / 1000)
+
+# ---------- SAVE LOG ----------
+run_df = pd.DataFrame(log_data)
+
+if os.path.exists(LOG_FILE):
+    existing_df = pd.read_excel(LOG_FILE)
+    final_df = pd.concat([existing_df, run_df], ignore_index=True)
+else:
+    final_df = run_df
+
+final_df.to_excel(LOG_FILE, index=False)
+print(f"\nEmail log updated: {LOG_FILE}")
+print("Dry run completed." if DRY_RUN else "All emails sent successfully.")
